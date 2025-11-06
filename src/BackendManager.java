@@ -4,35 +4,83 @@ import java.io.PrintWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.Date;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * BackendManager spawns 4 independent backend servers on ports 8081-8084.
+ * BackendManager spawns independent backend servers based on config.properties.
  * 
  * WHY: In a real load balancer setup, you'd have multiple backend servers.
- * This simulates that by running 4 servers in separate threads.
+ * This simulates that by running multiple servers in separate threads.
  * 
- * HOW: Creates 4 BackendServer threads, each listening on its own port.
- * Each server handles requests by echoing back a response with its port number.
+ * HOW: Reads backend ports from config, creates BackendServer threads.
+ * Each server handles requests and reports metrics to MetricsCollector.
+ * 
+ * UPDATED: Configurable ports, metrics reporting, controllable lifecycle for GUI.
  */
 public class BackendManager {
-    private static final int[] BACKEND_PORTS = {8081, 8082, 8083, 8084};
+    private static ConcurrentHashMap<Integer, BackendServer> servers = new ConcurrentHashMap<>();
     private static final Logger logger = Logger.getInstance();
+    private static final MetricsCollector metrics = MetricsCollector.getInstance();
     
     public static void main(String[] args) {
         logger.log("INFO", "BackendManager", "Starting Backend Manager...");
         
+        ConfigLoader config = ConfigLoader.getInstance();
+        int[] backendPorts = config.getBackendPorts();
+        
         // Start all backend servers
-        for (int port : BACKEND_PORTS) {
-            BackendServer server = new BackendServer(port);
-            Thread thread = new Thread(server);
-            thread.setName("Backend-" + port);
-            thread.start();
-            logger.log("INFO", "BackendManager", 
-                      "Started backend server on port " + port);
+        for (int port : backendPorts) {
+            startBackend(port);
         }
         
         logger.log("INFO", "BackendManager", 
-                  "All 4 backend servers are running and ready to accept connections");
+                  "All " + backendPorts.length + " backend servers are running");
+    }
+    
+    /**
+     * Start a backend server on specified port (called by main or GUI).
+     */
+    public static synchronized void startBackend(int port) {
+        if (servers.containsKey(port) && servers.get(port).isRunning()) {
+            logger.log("WARN", "BackendManager", 
+                      "Backend on port " + port + " is already running");
+            return;
+        }
+        
+        BackendServer server = new BackendServer(port);
+        Thread thread = new Thread(server);
+        thread.setName("Backend-" + port);
+        thread.start();
+        servers.put(port, server);
+        
+        metrics.setBackendStatus(port, true);
+        logger.log("INFO", "BackendManager", 
+                  "Started backend server on port " + port);
+    }
+    
+    /**
+     * Stop a backend server (for GUI crash simulation).
+     */
+    public static synchronized void stopBackend(int port) {
+        BackendServer server = servers.get(port);
+        if (server != null) {
+            server.shutdown();
+            servers.remove(port);
+            metrics.setBackendStatus(port, false);
+            logger.log("INFO", "BackendManager", 
+                      "Stopped backend server on port " + port);
+        } else {
+            logger.log("WARN", "BackendManager", 
+                      "No backend found on port " + port);
+        }
+    }
+    
+    /**
+     * Check if a backend is running.
+     */
+    public static boolean isBackendRunning(int port) {
+        BackendServer server = servers.get(port);
+        return server != null && server.isRunning();
     }
     
     /**
@@ -42,35 +90,68 @@ public class BackendManager {
      * 
      * HOW: Creates a ServerSocket, accepts connections in a loop, and spawns
      * a new thread for each connection to handle it concurrently.
+     * 
+     * UPDATED: Graceful shutdown support, metrics reporting.
      */
     static class BackendServer implements Runnable {
         private int port;
+        private volatile boolean running = false;
+        private ServerSocket serverSocket;
         
         public BackendServer(int port) {
             this.port = port;
         }
         
+        public boolean isRunning() {
+            return running;
+        }
+        
+        public void shutdown() {
+            running = false;
+            try {
+                if (serverSocket != null && !serverSocket.isClosed()) {
+                    serverSocket.close();
+                }
+            } catch (Exception e) {
+                logger.log("ERROR", "Backend-" + port, 
+                          "Error during shutdown: " + e.getMessage());
+            }
+        }
+        
         @Override
         public void run() {
-            try (ServerSocket serverSocket = new ServerSocket(port)) {
+            running = true;
+            try {
+                serverSocket = new ServerSocket(port);
                 logger.log("INFO", "Backend-" + port, 
                           "Backend server listening on port " + port);
+                metrics.setBackendStatus(port, true);
                 
                 // Continuously accept connections
-                while (true) {
+                while (running) {
                     try {
                         Socket clientSocket = serverSocket.accept();
+                        // Note: Connection metrics will be incremented in ConnectionHandler
+                        // after determining if it's a health check or real request
+
                         // Handle each connection in a separate thread
-                        Thread handler = new Thread(new ConnectionHandler(clientSocket, port));
+                        Thread handler = new Thread(
+                            new ConnectionHandler(clientSocket, port));
                         handler.start();
                     } catch (Exception e) {
-                        logger.log("ERROR", "Backend-" + port, 
-                                  "Error accepting connection: " + e.getMessage());
+                        if (running) {
+                            logger.log("ERROR", "Backend-" + port, 
+                                      "Error accepting connection: " + e.getMessage());
+                        }
                     }
                 }
             } catch (Exception e) {
                 logger.log("ERROR", "Backend-" + port, 
                           "Failed to start backend server: " + e.getMessage());
+            } finally {
+                running = false;
+                metrics.setBackendStatus(port, false);
+                logger.log("INFO", "Backend-" + port, "Backend server stopped");
             }
         }
     }
@@ -82,6 +163,8 @@ public class BackendManager {
      * 
      * HOW: Reads the request from the client (forwarded by load balancer),
      * and sends back a response identifying which backend handled it.
+     * 
+     * UPDATED: Added latency tracking for metrics.
      */
     static class ConnectionHandler implements Runnable {
         private Socket socket;
@@ -94,6 +177,9 @@ public class BackendManager {
         
         @Override
         public void run() {
+            long startTime = System.currentTimeMillis();
+            boolean metricsIncremented = false;
+
             try (
                 BufferedReader in = new BufferedReader(
                     new InputStreamReader(socket.getInputStream()));
@@ -102,17 +188,33 @@ public class BackendManager {
                 logger.log("INFO", "Backend-" + port, 
                           "Connection received from " + socket.getInetAddress());
                 
+                // Read the first line to check for health check marker
+                String firstLine = in.readLine();
+
+                // Check if this is a health check
+                if (firstLine != null && firstLine.equals("HEALTH_CHECK")) {
+                    logger.log("INFO", "Backend-" + port,
+                              "Health check received, skipping metrics");
+                    // Close immediately without response or metrics
+                    return;
+                }
+
+                // This is a real request, increment connection count IMMEDIATELY
+                metrics.incrementBackendConnections(port);
+                metricsIncremented = true;
+
+                logger.log("INFO", "Backend-" + port,
+                          "Real request detected, connection count incremented to " +
+                          metrics.getBackendMetrics().get(port).getActiveConnections());
+
                 // Read the request (could be multiple lines for HTTP)
                 StringBuilder request = new StringBuilder();
+                if (firstLine != null) {
+                    request.append(firstLine);
+                }
+
                 String line;
-                boolean firstLine = true;
-                
                 while ((line = in.readLine()) != null) {
-                    if (firstLine) {
-                        request.append(line);
-                        firstLine = false;
-                    }
-                    
                     // HTTP requests end with an empty line
                     if (line.isEmpty()) {
                         break;
@@ -137,13 +239,24 @@ public class BackendManager {
                 out.print(response);
                 out.flush();
                 
-                logger.log("INFO", "Backend-" + port, 
-                          "Response sent successfully");
+                long latency = System.currentTimeMillis() - startTime;
+                metrics.recordBackendRequest(port, latency);
                 
+                logger.log("INFO", "Backend-" + port, 
+                          "Response sent successfully (latency: " + latency + "ms, totalRequests now=" +
+                          metrics.getBackendMetrics().get(port).getTotalRequests() + ")");
+
             } catch (Exception e) {
                 logger.log("ERROR", "Backend-" + port, 
                           "Error handling connection: " + e.getMessage());
             } finally {
+                // Only decrement if we actually incremented (not a health check)
+                if (metricsIncremented) {
+                    metrics.decrementBackendConnections(port);
+                    logger.log("INFO", "Backend-" + port,
+                              "Connection closed, active connections now: " +
+                              metrics.getBackendMetrics().get(port).getActiveConnections());
+                }
                 try {
                     socket.close();
                 } catch (Exception e) {
